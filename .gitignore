@@ -1,0 +1,14 @@
+# Environment variables - NEVER commit this!
+.env
+*.env
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Log files
+*.log
+
+# IDE settings
+.vscode/
+.idea/
