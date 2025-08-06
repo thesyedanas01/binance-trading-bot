@@ -14,7 +14,7 @@ import time
 import hashlib
 import hmac
 
-app = Flask(__name__)
+app = Flask(_name_)
 
 # === Binance API Credentials ===
 API_KEY = os.getenv("BINANCE_API_KEY")
@@ -43,7 +43,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(_name_)
 
 # === Security Functions ===
 def validate_webhook_signature(data, signature):
@@ -72,12 +72,13 @@ def get_account_equity():
     for attempt in range(max_retries):
         try:
             account_info = client.futures_account()
+
             equity = float(account_info['totalWalletBalance'])
             available_balance = float(account_info['availableBalance'])
-            
+
             logger.info(f"Account equity: {equity} USDT, Available: {available_balance} USDT")
             return equity
-            
+
         except BinanceAPIException as e:
             logger.error(f"Binance API error (attempt {attempt + 1}): {e}")
             if attempt < max_retries - 1:
@@ -87,6 +88,18 @@ def get_account_equity():
         except Exception as e:
             logger.error(f"Unexpected error fetching account equity: {e}")
             return None
+
+def get_current_prices():
+    """Get the current best bid and ask prices from the order book."""
+    try:
+        ticker = client.futures_orderbook_ticker(symbol=SYMBOL)
+        return {
+            'bid': float(ticker['bidPrice']),
+            'ask': float(ticker['askPrice'])
+        }
+    except Exception as e:
+        logger.error(f"Error fetching order book ticker: {e}")
+        return None
 
 def get_symbol_info():
     """Get symbol information for precise calculations"""
@@ -137,11 +150,11 @@ def set_leverage(symbol, leverage):
         return False
 
 def round_price(value):
-    """Round price to 1 decimal precision for BTCUSDT"""
+    """Round price to 1 decimal precision for BTCUSDC"""
     return round(value, 1)
 
 def round_quantity(value):
-    """Round quantity to 3 decimal precision for BTCUSDT"""
+    """Round quantity to 3 decimal precision for BTCUSDC"""
     return round(value, 3)
 
 def validate_open_signal_data(data):
@@ -279,132 +292,126 @@ def handle_close_signal(direction, reason=None):
 
 def place_trade(direction, entry, sl, tp1, tp2):
     """
-    Places a trade with DYNAMIC leverage and position sizing to prevent liquidation before stop-loss.
+    Places a trade using LIMIT orders with full margin checks and a timeout.
     """
-    
-    # --- Step 1: Get Account and Market Data ---
-    equity = get_account_equity()
-    if equity is None:
-        return {"status": "error", "message": "Unable to fetch account equity"}
-
-    symbol_info = get_symbol_info()
-    if not symbol_info:
-        return {"status": "error", "message": "Unable to fetch symbol information"}
-
-    sl_distance = abs(entry - sl)
-    if sl_distance == 0:
-        return {"status": "error", "message": "Stop loss distance is zero"}
-
-    # --- Step 2: DYNAMIC LEVERAGE CALCULATION ---
-    sl_percent = sl_distance / entry
-    safe_leverage = math.floor(0.90 / sl_percent) if sl_percent > 0 else 125
-    dynamic_leverage = max(1, min(safe_leverage, 125))
-    logger.info(f"Stop-loss is {sl_percent:.2%} away. Calculated safe dynamic leverage: {dynamic_leverage}x")
-
-    # --- Step 3: Calculate Position Size based on Risk ---
-    risk_amount = equity * RISK_PERCENT
-    final_qty = risk_amount / sl_distance
-    
-    # --- Step 4: Check Margin and Downsize if Necessary ---
-    max_margin_for_trade = equity * 0.95 
-    required_margin = (final_qty * entry) / dynamic_leverage
-
-    if required_margin > max_margin_for_trade:
-        logger.warning("Ideal position size requires too much margin. Downsizing to max possible.")
-        max_position_notional = max_margin_for_trade * dynamic_leverage
-        final_qty = max_position_notional / entry
-        logger.warning(f"Downsized Qty: {final_qty:.3f}")
-
-    final_qty = round(final_qty, symbol_info['quantity_precision'])
-    
-    if final_qty < symbol_info['min_qty']:
-        return {
-            "status": "error", 
-            "message": f"Calculated quantity {final_qty} below minimum {symbol_info['min_qty']}"
-        }
-
-    required_margin = (final_qty * entry) / dynamic_leverage
-    logger.info(f"FINAL TRADE CALCULATION - Leverage: {dynamic_leverage}x, Quantity: {final_qty}, Required Margin: {required_margin:.2f}")
-
-    orders_placed = []
     try:
-        # --- Step 5: Execute the Trade ---
+        # --- Step 1: Get Account and Market Data ---
+        equity = get_account_equity()
+        if equity is None:
+            return {"status": "error", "message": "Unable to fetch account equity"}
+
+        symbol_info = get_symbol_info()
+        if not symbol_info:
+            return {"status": "error", "message": "Unable to fetch symbol information"}
+
+        current_prices = get_current_prices()
+        if not current_prices:
+            return {"status": "error", "message": "Unable to fetch current prices"}
+
+        sl_distance = abs(entry - sl)
+        if sl_distance == 0:
+            return {"status": "error", "message": "Stop loss distance is zero"}
+
+        # --- Step 2 & 3: Leverage and Position Size Calculation ---
+        sl_percent = sl_distance / entry
+        safe_leverage = math.floor(0.90 / sl_percent) if sl_percent > 0 else 125
+        dynamic_leverage = max(1, min(safe_leverage, 125))
+        
+        risk_amount = equity * RISK_PERCENT
+        final_qty = risk_amount / sl_distance
+        
+        # --- Step 4: Margin Check and Downsizing (THE MISSING PIECE) ---
+        max_margin_for_trade = equity * 0.95
+        required_margin = (final_qty * entry) / dynamic_leverage
+
+        if required_margin > max_margin_for_trade:
+            logger.warning("Ideal position size requires too much margin. Downsizing to max possible.")
+            max_position_notional = max_margin_for_trade * dynamic_leverage
+            final_qty = max_position_notional / entry
+            logger.warning(f"Downsized Qty: {final_qty:.3f}")
+
+        final_qty = round(final_qty, symbol_info['quantity_precision'])
+
+        if final_qty < symbol_info['min_qty']:
+            return {"status": "error", "message": f"Calculated quantity {final_qty} below minimum {symbol_info['min_qty']}"}
+
+        logger.info(f"CALCULATION - Leverage: {dynamic_leverage}x, Quantity: {final_qty}")
+
+        # --- Step 5: Prepare and Place LIMIT Entry Order ---
         cancel_existing_orders()
         close_existing_positions()
         time.sleep(1)
-        
+
         if not set_leverage(SYMBOL, dynamic_leverage):
             return {"status": "error", "message": "Failed to set dynamic leverage"}
 
         side = 'BUY' if direction.lower() == "long" else 'SELL'
-        opposite_side = 'SELL' if side == 'BUY' else 'BUY'
+        
+        limit_price = current_prices['bid'] if side == 'BUY' else current_prices['ask']
+        limit_price = round(limit_price, symbol_info['price_precision'])
 
+        logger.info(f"Placing LIMIT {side} order for {final_qty} {SYMBOL} at {limit_price}")
+        
+        entry_order = client.futures_create_order(
+            symbol=SYMBOL, side=side, type='LIMIT',
+            quantity=final_qty, price=limit_price, timeInForce='GTC'
+        )
+        entry_order_id = entry_order['orderId']
+
+        # --- Step 6: Wait for the Order to Fill ---
+        order_filled = False
+        WAIT_TIME_SECONDS = 60
+        order_status = None # Define order_status here
+        for i in range(WAIT_TIME_SECONDS // 5):
+            time.sleep(5)
+            order_status = client.futures_get_order(symbol=SYMBOL, orderId=entry_order_id)
+            
+            if order_status['status'] == 'FILLED':
+                logger.info(f"Entry order {entry_order_id} has been filled!")
+                order_filled = True
+                break
+            else:
+                logger.info(f"Waiting for entry order {entry_order_id} to fill... Status: {order_status['status']}")
+
+        # --- Step 7: Handle the Outcome ---
+        if not order_filled:
+            logger.warning(f"Entry order {entry_order_id} timed out. Cancelling.")
+            client.futures_cancel_order(symbol=SYMBOL, orderId=entry_order_id)
+            return {"status": "error", "message": "Entry order timed out and was cancelled."}
+
+        # --- Step 8: Place SL and TP Orders ---
+        logger.info("Entry confirmed. Placing Stop Loss and Take Profit orders.")
+        
+        filled_qty = float(order_status['executedQty'])
+        opposite_side = 'SELL' if side == 'BUY' else 'BUY'
+        
         sl_price = round_price(sl)
         tp1_price = round_price(tp1)
         tp2_price = round_price(tp2)
 
-        entry_order = client.futures_create_order(symbol=SYMBOL, side=side, type='MARKET', quantity=final_qty)
-        orders_placed.append(("entry", entry_order['orderId']))
-        logger.info(f"Entry order executed: {entry_order['orderId']}")
-        time.sleep(3)
-
-        positions = client.futures_position_information(symbol=SYMBOL)
-        active_position = next((p for p in positions if float(p['positionAmt']) != 0), None)
-        
-        if not active_position:
-            cancel_existing_orders()
-            return {"status": "error", "message": "Position was not created after entry order"}
-
-        actual_qty = abs(float(active_position['positionAmt']))
-        logger.info(f"Position created with quantity: {actual_qty}")
-
-        tp1_qty = round(actual_qty * 0.5, symbol_info['quantity_precision'])
-        tp1_order = None
+        tp1_qty = round(filled_qty * 0.5, symbol_info['quantity_precision'])
         if tp1_qty >= symbol_info['min_qty']:
-            tp1_order = client.futures_create_order(symbol=SYMBOL, side=opposite_side, type='LIMIT', quantity=tp1_qty, price=tp1_price, timeInForce='GTC', reduceOnly=True)
-            orders_placed.append(("tp1", tp1_order['orderId']))
-            logger.info(f"TP1 order placed: {tp1_order['orderId']}")
+            client.futures_create_order(symbol=SYMBOL, side=opposite_side, type='LIMIT', quantity=tp1_qty, price=tp1_price, timeInForce='GTC', reduceOnly=True)
+            logger.info(f"TP1 order placed at {tp1_price}")
 
-        tp2_qty = round(actual_qty - tp1_qty, symbol_info['quantity_precision']) if tp1_order else actual_qty
-        tp2_order = None
+        tp2_qty = round(filled_qty - tp1_qty, symbol_info['quantity_precision'])
         if tp2_qty >= symbol_info['min_qty']:
-            tp2_order = client.futures_create_order(symbol=SYMBOL, side=opposite_side, type='LIMIT', quantity=tp2_qty, price=tp2_price, timeInForce='GTC', reduceOnly=True)
-            orders_placed.append(("tp2", tp2_order['orderId']))
-            logger.info(f"TP2 order placed: {tp2_order['orderId']}")
+            client.futures_create_order(symbol=SYMBOL, side=opposite_side, type='LIMIT', quantity=tp2_qty, price=tp2_price, timeInForce='GTC', reduceOnly=True)
+            logger.info(f"TP2 order placed at {tp2_price}")
 
-        sl_order = client.futures_create_order(symbol=SYMBOL, side=opposite_side, type='STOP_MARKET', stopPrice=sl_price, quantity=actual_qty, timeInForce='GTC', reduceOnly=True)
-        orders_placed.append(("stop_loss", sl_order['orderId']))
-        logger.info(f"Stop Loss order placed: {sl_order['orderId']}")
+        client.futures_create_order(symbol=SYMBOL, side=opposite_side, type='STOP_MARKET', stopPrice=sl_price, quantity=filled_qty, timeInForce='GTC', reduceOnly=True)
+        logger.info(f"Stop Loss order placed at {sl_price}")
 
-        trade_details = { "direction": direction, "quantity": actual_qty }
-        return { "status": "success", "message": "Trade executed successfully", "details": trade_details }
+        return {"status": "success", "message": "Trade executed successfully with limit order."}
 
-    except BinanceOrderException as e:
-        logger.error(f"Binance order error: {e}")
-        for order_type, order_id in orders_placed:
-            try:
-                client.futures_cancel_order(symbol=SYMBOL, orderId=order_id)
-                logger.info(f"Cancelled {order_type} order: {order_id}")
-            except:
-                pass
-        try:
-            close_existing_positions()
-        except:
-            pass
-        return {"status": "error", "message": f"Order error: {str(e)}"}
-    
-    except BinanceAPIException as e:
-        logger.error(f"Binance API error: {e}")
-        return {"status": "error", "message": f"API error: {str(e)}"}
-    
+    except (BinanceAPIException, BinanceOrderException) as e:
+        logger.error(f"An error occurred: {e}")
+        close_existing_positions()
+        cancel_existing_orders()
+        return {"status": "error", "message": f"An error occurred: {e}"}
     except Exception as e:
-        logger.error(f"Unexpected error in place_trade: {e}")
-        try:
-            cancel_existing_orders()
-            close_existing_positions()
-        except:
-            pass
-        return {"status": "error", "message": f"Unexpected error: {str(e)}"}
+        logger.error(f"An unexpected error occurred: {e}")
+        return {"status": "error", "message": f"An unexpected error occurred: {e}"}
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -536,7 +543,6 @@ def cancel_all_orders():
         logger.error(f"Cancel orders error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
-
 @app.route('/close-position', methods=['POST'])
 def close_position():
     """Emergency endpoint to close current position"""
@@ -578,7 +584,7 @@ def internal_error(error):
 
 
 # === Run Server ===
-if __name__ == '__main__':
+if _name_ == '_main_':
     logger.info("Starting Robust Flask Trading Bot...")
     logger.info(f"Configuration - Symbol: {SYMBOL}, Risk: {RISK_PERCENT*100}%")
     
@@ -591,7 +597,7 @@ if __name__ == '__main__':
         if symbol_info:
             logger.info(f"✅ Symbol info loaded - Min qty: {symbol_info['min_qty']}, Tick size: {symbol_info['tick_size']}")
         else:
-            logger.error("⚠️ Failed to load symbol information")
+            logger.error("⚠ Failed to load symbol information")
             
     except Exception as e:
         logger.error(f"❌ Failed to connect to Binance API: {e}")
@@ -604,4 +610,3 @@ if __name__ == '__main__':
     
     logger.info("🚀 Bot is ready to receive webhooks with OPEN/CLOSE actions")
     app.run(debug=False, host='0.0.0.0', port=5000)
-
